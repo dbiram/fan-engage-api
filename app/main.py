@@ -1,13 +1,15 @@
 import os, io, uuid, tempfile, subprocess, datetime
 from urllib.parse import urlparse
 from typing import List
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
 from minio import Minio
 from minio.error import S3Error
+from pydantic import BaseModel
+import pandas as pd
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://app:app@postgres:5432/app")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
@@ -18,11 +20,17 @@ EXTERNAL_MINIO_ENDPOINT = os.getenv("EXTERNAL_MINIO_ENDPOINT")
 MINIO_REGION = os.getenv("MINIO_REGION", "us-east-1")
 BUCKET_RAW = os.getenv("BUCKET_RAW", "raw")
 BUCKET_FRAMES = os.getenv("BUCKET_FRAMES", "frames")
+BUCKET_DETECTIONS = os.getenv("BUCKET_DETECTIONS", "detections")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 class Match(Base):
     __tablename__ = "matches"
@@ -30,6 +38,17 @@ class Match(Base):
     title = Column(String, nullable=False)
     object_key = Column(String, nullable=False)  # s3 key to the mp4
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class DetectionRecord(BaseModel):
+    frame_id: int
+    filename: str
+    class_name: str
+    conf: float
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    object_id: int | None
 
 Base.metadata.create_all(engine)
 
@@ -60,7 +79,7 @@ def ensure_bucket(name: str):
     if not found:
         s3_internal.make_bucket(name)
 
-for b in (BUCKET_RAW, BUCKET_FRAMES):
+for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS):
     try:
         ensure_bucket(b)
     except S3Error:
@@ -121,3 +140,118 @@ def ingest_video(title: str = Form(...), file: UploadFile = File(...)):
     except: pass
 
     return {"id": match.id, "title": match.title}
+
+def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
+    """
+    Run detection on all frames for a match and upload results to MinIO.
+    Returns the MinIO key for the Parquet file.
+    """
+    if YOLO is None:
+        # ultralytics not installed in API image
+        raise HTTPException(status_code=500, detail="ultralytics not installed")
+
+    prefix = f"match_{match_id}/"
+    objects = s3_internal.list_objects(BUCKET_FRAMES, prefix=prefix, recursive=True)
+    frame_keys = sorted([o.object_name for o in objects if o.object_name.endswith((".jpg", ".png"))])
+
+    if not frame_keys:
+        raise HTTPException(status_code=404, detail="No frames found for this match")
+
+    tmp_dir = tempfile.mkdtemp(prefix=f"detect_{match_id}_")
+    local_frames = []
+
+    for key in frame_keys:
+        local_img = os.path.join(tmp_dir, os.path.basename(key))
+        s3_internal.fget_object(BUCKET_FRAMES, key, local_img)
+        local_frames.append(local_img)
+
+    model = YOLO("yolov8n.pt")
+    results_gen = model.track(
+        source=tmp_dir,
+        stream=True,
+        conf=conf_thres,
+        tracker="bytetrack.yaml",
+        persist=True,   # keep IDs across frames
+        verbose=False,
+    )
+
+    rows = []
+    frame_index = {os.path.basename(p): idx for idx, p in enumerate(local_frames)}
+    for r in results_gen:
+        basename = os.path.basename(getattr(r, "path", ""))  # e.g., frame_00010.jpg
+        frame_id = frame_index.get(basename, None)
+
+        if frame_id is None or r.boxes is None:
+            continue
+
+        boxes = r.boxes
+        # boxes.id may be None if tracker didn't assign an ID (e.g., first frames)
+        ids = boxes.id.cpu().tolist() if getattr(boxes, "id", None) is not None else [None] * len(boxes)
+        clss = boxes.cls.cpu().tolist() if getattr(boxes, "cls", None) is not None else [None] * len(boxes)
+        confs = boxes.conf.cpu().tolist() if getattr(boxes, "conf", None) is not None else [None] * len(boxes)
+        xyxys = boxes.xyxy.cpu().tolist()
+
+        for obj_id, cls_idx, conf, (x1, y1, x2, y2) in zip(ids, clss, confs, xyxys):
+            class_name = model.names[int(cls_idx)] if cls_idx is not None else "object"
+            rows.append({
+                "frame_id": int(frame_id),
+                "filename": f"{prefix}{basename}",
+                "class_name": class_name,
+                "conf": float(conf) if conf is not None else None,
+                "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+                "object_id": int(obj_id) if obj_id is not None else None,
+            })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise HTTPException(status_code=422, detail="No detections produced")
+    out_filename = f"match_{match_id}.parquet"
+    local_out = os.path.join(tmp_dir, out_filename)
+    df.to_parquet(local_out)
+
+    dest_key = f"match_{match_id}/{out_filename}"
+    s3_internal.fput_object(BUCKET_DETECTIONS, dest_key, local_out)
+    return dest_key
+
+@app.get("/analyze/detections")
+def analyze_detections(match_id: int):
+    """
+    Synchronously run detection for a match and return the MinIO key to the Parquet file.
+    (We’ll move this to a background worker in a later phase.)
+    """
+    key = run_detection(match_id)
+    return {"match_id": match_id, "key": key}
+
+@app.get("/matches/{match_id}/detections", response_model=List[DetectionRecord])
+def get_detections(match_id: int):
+    """
+    Download detections Parquet for this match from MinIO and return as JSON.
+    """
+    prefix = f"match_{match_id}/"
+    objects = s3_internal.list_objects(BUCKET_DETECTIONS, prefix=prefix, recursive=True)
+    file_key = None
+    for obj in objects:
+        if obj.object_name.endswith(".parquet"):
+            file_key = obj.object_name
+            break
+    if not file_key:
+        raise HTTPException(status_code=404, detail="Detections not found. Run /analyze/detections first.")
+
+    import tempfile, os
+    tmp_dir = tempfile.mkdtemp(prefix=f"detections_{match_id}_")
+    local_file = os.path.join(tmp_dir, os.path.basename(file_key))
+    s3_internal.fget_object(BUCKET_DETECTIONS, file_key, local_file)
+
+    df = pd.read_parquet(local_file)
+
+    # Ensure object_id is int or None
+    if "object_id" in df.columns:
+        # First coerce to pandas nullable Int64, then convert NA to None
+        df["object_id"] = df["object_id"].astype("Int64").astype(object).where(df["object_id"].notna(), None)
+
+    # Replace any remaining NaN in the dataframe with None (safe for JSON)
+    df = df.where(pd.notnull(df), None)
+
+    # Convert to list of dicts
+    records = df.to_dict(orient="records")
+    return records
