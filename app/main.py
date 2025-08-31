@@ -206,11 +206,13 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
     weights = CUSTOM_MODEL_PATH if CUSTOM_MODEL_PATH and os.path.exists(CUSTOM_MODEL_PATH) else "yolov8n.pt"
     model = YOLO(weights)
     print("Model class names:", model.names)
+    print(f"[Detection] Running on {len(local_frames)} frames with conf_thres={conf_thres}, weights={weights}")
 
     results_gen = model.track(
         source=tmp_dir,
         stream=True,
         conf=conf_thres,
+        imgsz=1280,
         tracker="bytetrack.yaml",
         persist=True,   # keep IDs across frames
         verbose=False,
