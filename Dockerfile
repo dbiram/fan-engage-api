@@ -4,6 +4,11 @@ RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/list
 
 WORKDIR /app
 COPY requirements.txt .
+# === PyTorch NIGHTLY with CUDA 12.8 (includes SM 12.0 / Blackwell) ===
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu128
+RUN pip install --no-cache-dir --pre --index-url $TORCH_INDEX_URL \
+    torch
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app

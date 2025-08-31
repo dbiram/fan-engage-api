@@ -10,6 +10,17 @@ from minio import Minio
 from minio.error import S3Error
 from pydantic import BaseModel
 import pandas as pd
+import json
+from torch.serialization import add_safe_globals
+try:
+    from ultralytics.nn.tasks import DetectionModel, SegmentationModel, PoseModel
+    add_safe_globals([DetectionModel, SegmentationModel, PoseModel])
+except Exception:
+    try:
+        from ultralytics.nn.tasks import DetectionModel
+        add_safe_globals([DetectionModel])
+    except Exception:
+        pass
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://app:app@postgres:5432/app")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
@@ -21,6 +32,9 @@ MINIO_REGION = os.getenv("MINIO_REGION", "us-east-1")
 BUCKET_RAW = os.getenv("BUCKET_RAW", "raw")
 BUCKET_FRAMES = os.getenv("BUCKET_FRAMES", "frames")
 BUCKET_DETECTIONS = os.getenv("BUCKET_DETECTIONS", "detections")
+BUCKET_MODELS = os.getenv("BUCKET_MODELS", "models")
+MODEL_LATEST_META = os.getenv("MODEL_LATEST_META", "yolov8n_football/latest.json")
+MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/models/best.pt")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -79,11 +93,35 @@ def ensure_bucket(name: str):
     if not found:
         s3_internal.make_bucket(name)
 
-for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS):
+def _download_model_if_needed():
+    # if local exists, keep it (you can add hash checks later)
+    if os.path.exists(MODEL_LOCAL_PATH):
+        return MODEL_LOCAL_PATH
+    # fetch latest.json
+    meta_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json").name
+    try:
+        s3_internal.fget_object(BUCKET_MODELS, MODEL_LATEST_META, meta_tmp)
+    except Exception as e:
+        print(f"[model] latest.json not found in MinIO ({BUCKET_MODELS}/{MODEL_LATEST_META}) -> using default yolov8n", e)
+        return None
+    with open(meta_tmp, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    best_key = meta.get("best_pt")
+    if not best_key:
+        print("[model] best_pt missing in latest.json")
+        return None
+    os.makedirs(os.path.dirname(MODEL_LOCAL_PATH), exist_ok=True)
+    s3_internal.fget_object(BUCKET_MODELS, best_key, MODEL_LOCAL_PATH)
+    print(f"[model] downloaded {best_key} -> {MODEL_LOCAL_PATH}")
+    return MODEL_LOCAL_PATH
+
+for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS):
     try:
         ensure_bucket(b)
     except S3Error:
         pass
+
+CUSTOM_MODEL_PATH = _download_model_if_needed()
 
 app = FastAPI()
 app.add_middleware(
@@ -124,10 +162,10 @@ def ingest_video(title: str = Form(...), file: UploadFile = File(...)):
         match = Match(title=title, object_key=key)
         db.add(match); db.commit(); db.refresh(match)
 
-    # Extract frames (1 fps for demo) to local temp dir, then upload to MinIO
+    # Extract frames (25 fps for demo) to local temp dir, then upload to MinIO
     frames_dir = tempfile.mkdtemp()
     out_pattern = os.path.join(frames_dir, "frame_%05d.jpg")
-    cmd = ["ffmpeg", "-y", "-i", tmp_path, "-vf", "fps=1", out_pattern]
+    cmd = ["ffmpeg", "-y", "-i", tmp_path, "-vf", "fps=25", out_pattern]
     subprocess.run(cmd, check=True)
 
     # Upload frames
@@ -165,7 +203,10 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
         s3_internal.fget_object(BUCKET_FRAMES, key, local_img)
         local_frames.append(local_img)
 
-    model = YOLO("yolov8n.pt")
+    weights = CUSTOM_MODEL_PATH if CUSTOM_MODEL_PATH and os.path.exists(CUSTOM_MODEL_PATH) else "yolov8n.pt"
+    model = YOLO(weights)
+    print("Model class names:", model.names)
+
     results_gen = model.track(
         source=tmp_dir,
         stream=True,
@@ -177,6 +218,10 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
 
     rows = []
     frame_index = {os.path.basename(p): idx for idx, p in enumerate(local_frames)}
+    total_frames = len(local_frames)
+    checkpoint_interval = max(1, total_frames // 10)
+    processed_frames = 0
+
     for r in results_gen:
         basename = os.path.basename(getattr(r, "path", ""))  # e.g., frame_00010.jpg
         frame_id = frame_index.get(basename, None)
@@ -202,6 +247,10 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
                 "object_id": int(obj_id) if obj_id is not None else None,
             })
 
+        processed_frames += 1
+        if processed_frames % checkpoint_interval == 0 or processed_frames == total_frames:
+            print(f"[Detection] Processed {processed_frames}/{total_frames} frames ({(processed_frames/total_frames)*100:.1f}%)")
+
     df = pd.DataFrame(rows)
     if df.empty:
         raise HTTPException(status_code=422, detail="No detections produced")
@@ -219,7 +268,7 @@ def analyze_detections(match_id: int):
     Synchronously run detection for a match and return the MinIO key to the Parquet file.
     (We’ll move this to a background worker in a later phase.)
     """
-    key = run_detection(match_id)
+    key = run_detection(match_id, conf_thres=0.1)
     return {"match_id": match_id, "key": key}
 
 @app.get("/matches/{match_id}/detections", response_model=List[DetectionRecord])
