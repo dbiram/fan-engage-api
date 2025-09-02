@@ -9,7 +9,8 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/nightly/cu128
 RUN pip install --no-cache-dir --pre --index-url $TORCH_INDEX_URL \
     torch
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 ENV PYTHONUNBUFFERED=1

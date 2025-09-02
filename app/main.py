@@ -1,9 +1,12 @@
-import os, io, uuid, tempfile, subprocess, datetime
+import os, io, uuid, tempfile, subprocess, datetime, pathlib
 from urllib.parse import urlparse
 from typing import List
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+from .services.team_assignment import assign_teams_for_match
+
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
 from minio import Minio
@@ -32,6 +35,7 @@ MINIO_REGION = os.getenv("MINIO_REGION", "us-east-1")
 BUCKET_RAW = os.getenv("BUCKET_RAW", "raw")
 BUCKET_FRAMES = os.getenv("BUCKET_FRAMES", "frames")
 BUCKET_DETECTIONS = os.getenv("BUCKET_DETECTIONS", "detections")
+BUCKET_TRACKS = os.getenv("BUCKET_TRACKS", "tracks")
 BUCKET_MODELS = os.getenv("BUCKET_MODELS", "models")
 MODEL_LATEST_META = os.getenv("MODEL_LATEST_META", "yolov8n_football/latest.json")
 MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/models/best.pt")
@@ -306,3 +310,24 @@ def get_detections(match_id: int):
     # Convert to list of dicts
     records = df.to_dict(orient="records")
     return records
+
+@app.post("/teams/assign")
+def teams_assign(match_id: int):
+    try:
+        result = assign_teams_for_match(match_id, s3_internal)
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/matches/{match_id}/tracks")
+def get_tracks(match_id: int):
+    key = f"match_{match_id}/match_{match_id}.parquet"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            dst = os.path.join(td, pathlib.Path(key).name)
+            s3_internal.fget_object(BUCKET_TRACKS, key, dst)
+            df = pd.read_parquet(dst, engine="pyarrow")
+    except Exception:
+        # Not found (or bucket missing)
+        raise HTTPException(status_code=404, detail="tracks not found")
+    return JSONResponse(df.to_dict(orient="records"))
