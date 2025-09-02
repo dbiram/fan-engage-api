@@ -6,8 +6,13 @@ python-dotenv==1.0.1
 minio==7.2.7
 ffmpeg-python==0.2.0
 ultralytics==8.3.3
+numpy==1.26.4
 pandas==2.2.2
-pyarrow==15.0.0
-opencv-python==4.9.0.80
 filterpy==1.4.5
 scipy==1.13.1
+pyarrow==16.1.0
+opencv-python-headless==4.9.0.80
+Pillow==10.3.0
+open-clip-torch
+scikit-learn==1.5.1
+umap-learn==0.5.6
