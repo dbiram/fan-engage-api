@@ -16,3 +16,5 @@ Pillow==10.3.0
 open-clip-torch
 scikit-learn==1.5.1
 umap-learn==0.5.6
+onnx==1.16.1
+onnxruntime==1.18.0

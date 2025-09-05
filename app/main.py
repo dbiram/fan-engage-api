@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .services.team_assignment import assign_teams_for_match
+from .services.homography import estimate_homography_for_match
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -37,6 +38,7 @@ BUCKET_FRAMES = os.getenv("BUCKET_FRAMES", "frames")
 BUCKET_DETECTIONS = os.getenv("BUCKET_DETECTIONS", "detections")
 BUCKET_TRACKS = os.getenv("BUCKET_TRACKS", "tracks")
 BUCKET_MODELS = os.getenv("BUCKET_MODELS", "models")
+BUCKET_HOMOGRAPHY = os.getenv("BUCKET_HOMOGRAPHY", "homography")
 MODEL_LATEST_META = os.getenv("MODEL_LATEST_META", "yolov8n_football/latest.json")
 MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/models/best.pt")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
@@ -331,3 +333,28 @@ def get_tracks(match_id: int):
         # Not found (or bucket missing)
         raise HTTPException(status_code=404, detail="tracks not found")
     return JSONResponse(df.to_dict(orient="records"))
+
+@app.post("/homography/estimate")
+def homography_estimate(match_id: int, segment_frames: int = 250, step: int = 5, conf_th: float = 0.5):
+    try:
+        result = estimate_homography_for_match(match_id, segment_frames, step, conf_th, s3_internal)
+        return JSONResponse(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/matches/{match_id}/homography")
+def homography_list(match_id: int):
+    prefix = f"match_{match_id}/"
+    objs = list(s3_internal.list_objects(BUCKET_HOMOGRAPHY, prefix=prefix, recursive=True))
+    if not objs:
+        raise HTTPException(status_code=404, detail="no homography found")
+    items = []
+    with tempfile.TemporaryDirectory() as td:
+        for o in objs:
+            dst = os.path.join(td, pathlib.Path(o.object_name).name)
+            s3_internal.fget_object(BUCKET_HOMOGRAPHY, o.object_name, dst)
+            with open(dst, "r") as f:
+                items.append(json.load(f))
+    # sort by segment_index
+    items.sort(key=lambda x: x.get("segment_index", 0))
+    return JSONResponse(items)
