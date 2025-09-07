@@ -40,7 +40,9 @@ BUCKET_TRACKS = os.getenv("BUCKET_TRACKS", "tracks")
 BUCKET_MODELS = os.getenv("BUCKET_MODELS", "models")
 BUCKET_HOMOGRAPHY = os.getenv("BUCKET_HOMOGRAPHY", "homography")
 MODEL_LATEST_META = os.getenv("MODEL_LATEST_META", "yolov8n_football/latest.json")
+BALL_MODEL_LATEST_META = os.getenv("BALL_MODEL_LATEST_META", "ball_detection/latest.json")
 MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/models/best.pt")
+BALL_MODEL_LOCAL_PATH = os.getenv("BALL_MODEL_LOCAL_PATH", "/models/ball_detection/best.pt")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -99,16 +101,16 @@ def ensure_bucket(name: str):
     if not found:
         s3_internal.make_bucket(name)
 
-def _download_model_if_needed():
+def _download_model_if_needed(model_meta: str, local_path: str):
     # if local exists, keep it (you can add hash checks later)
-    if os.path.exists(MODEL_LOCAL_PATH):
-        return MODEL_LOCAL_PATH
+    if os.path.exists(local_path):
+        return local_path
     # fetch latest.json
     meta_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json").name
     try:
-        s3_internal.fget_object(BUCKET_MODELS, MODEL_LATEST_META, meta_tmp)
+        s3_internal.fget_object(BUCKET_MODELS, model_meta, meta_tmp)
     except Exception as e:
-        print(f"[model] latest.json not found in MinIO ({BUCKET_MODELS}/{MODEL_LATEST_META}) -> using default yolov8n", e)
+        print(f"[model] latest.json not found in MinIO ({BUCKET_MODELS}/{model_meta}) -> using default yolov8n", e)
         return None
     with open(meta_tmp, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -116,10 +118,10 @@ def _download_model_if_needed():
     if not best_key:
         print("[model] best_pt missing in latest.json")
         return None
-    os.makedirs(os.path.dirname(MODEL_LOCAL_PATH), exist_ok=True)
-    s3_internal.fget_object(BUCKET_MODELS, best_key, MODEL_LOCAL_PATH)
-    print(f"[model] downloaded {best_key} -> {MODEL_LOCAL_PATH}")
-    return MODEL_LOCAL_PATH
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    s3_internal.fget_object(BUCKET_MODELS, best_key, local_path)
+    print(f"[model] downloaded {best_key} -> {local_path}")
+    return local_path
 
 for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS):
     try:
@@ -127,7 +129,8 @@ for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS):
     except S3Error:
         pass
 
-CUSTOM_MODEL_PATH = _download_model_if_needed()
+CUSTOM_MODEL_PATH = _download_model_if_needed(MODEL_LATEST_META, MODEL_LOCAL_PATH)
+BALL_MODEL_PATH = _download_model_if_needed(BALL_MODEL_LATEST_META, BALL_MODEL_LOCAL_PATH)
 
 app = FastAPI()
 app.add_middleware(
@@ -145,7 +148,6 @@ def list_matches():
     print("EXTERNAL_MINIO_ENDPOINT:", EXTERNAL_MINIO_ENDPOINT)
     with SessionLocal() as db:
         rows = db.query(Match).order_by(Match.created_at.desc()).all()
-    # For Phase 1, return a presigned URL for the MP4
     out = []
     for m in rows:
         url = s3_presign.presigned_get_object(BUCKET_RAW, m.object_key, expires=datetime.timedelta(hours=1))
@@ -209,11 +211,25 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
         s3_internal.fget_object(BUCKET_FRAMES, key, local_img)
         local_frames.append(local_img)
 
+    # Load both models
     weights = CUSTOM_MODEL_PATH if CUSTOM_MODEL_PATH and os.path.exists(CUSTOM_MODEL_PATH) else "yolov8n.pt"
+    ball_weights = BALL_MODEL_PATH if BALL_MODEL_PATH and os.path.exists(BALL_MODEL_PATH) else None
+    
     model = YOLO(weights)
-    print("Model class names:", model.names)
+    ball_model = YOLO(ball_weights) if ball_weights else None
+    
+    print("Main model class names:", model.names)
+    if ball_model:
+        print("Ball model class names:", ball_model.names)
     print(f"[Detection] Running on {len(local_frames)} frames with conf_thres={conf_thres}, weights={weights}")
 
+    rows = []
+    frame_index = {os.path.basename(p): idx for idx, p in enumerate(local_frames)}
+    total_frames = len(local_frames)
+    checkpoint_interval = max(1, total_frames // 10)
+    processed_frames = 0
+
+    # Run main model first
     results_gen = model.track(
         source=tmp_dir,
         stream=True,
@@ -223,12 +239,6 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
         persist=True,   # keep IDs across frames
         verbose=False,
     )
-
-    rows = []
-    frame_index = {os.path.basename(p): idx for idx, p in enumerate(local_frames)}
-    total_frames = len(local_frames)
-    checkpoint_interval = max(1, total_frames // 10)
-    processed_frames = 0
 
     for r in results_gen:
         basename = os.path.basename(getattr(r, "path", ""))  # e.g., frame_00010.jpg
@@ -246,18 +256,62 @@ def run_detection(match_id: int, conf_thres: float = 0.25) -> str:
 
         for obj_id, cls_idx, conf, (x1, y1, x2, y2) in zip(ids, clss, confs, xyxys):
             class_name = model.names[int(cls_idx)] if cls_idx is not None else "object"
-            rows.append({
-                "frame_id": int(frame_id),
-                "filename": f"{prefix}{basename}",
-                "class_name": class_name,
-                "conf": float(conf) if conf is not None else None,
-                "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
-                "object_id": int(obj_id) if obj_id is not None else None,
-            })
-
+            if class_name != "ball":  # Skip balls from main model
+                rows.append({
+                    "frame_id": int(frame_id),
+                    "filename": f"{prefix}{basename}",
+                    "class_name": class_name,
+                    "conf": float(conf) if conf is not None else None,
+                    "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+                    "object_id": int(obj_id) if obj_id is not None else None,
+                })
         processed_frames += 1
         if processed_frames % checkpoint_interval == 0 or processed_frames == total_frames:
-            print(f"[Detection] Processed {processed_frames}/{total_frames} frames ({(processed_frames/total_frames)*100:.1f}%)")
+            print(f"[Players Detection] Processed {processed_frames}/{total_frames} frames ({(processed_frames/total_frames)*100:.1f}%)")
+
+    # Run ball detection model if available (without tracking)
+    if ball_model:
+        ball_results_gen = ball_model.predict(
+            source=tmp_dir,
+            stream=True,
+            conf=conf_thres,
+            imgsz=1280,
+            verbose=False,
+        )
+        processed_frames = 0
+
+        for r in ball_results_gen:
+            basename = os.path.basename(getattr(r, "path", ""))
+            frame_id = frame_index.get(basename, None)
+
+            if frame_id is None or r.boxes is None:
+                continue
+
+            boxes = r.boxes
+            clss = boxes.cls.cpu().tolist() if getattr(boxes, "cls", None) is not None else [None] * len(boxes)
+            confs = boxes.conf.cpu().tolist() if getattr(boxes, "conf", None) is not None else [None] * len(boxes)
+            xyxys = boxes.xyxy.cpu().tolist()
+
+            # Take the highest confidence ball detection in each frame
+            if len(confs) > 0:
+                best_idx = max(range(len(confs)), key=lambda i: confs[i])
+                cls_idx = clss[best_idx]
+                conf = confs[best_idx]
+                x1, y1, x2, y2 = xyxys[best_idx]
+
+                rows.append({
+                    "frame_id": int(frame_id),
+                    "filename": f"{prefix}{basename}",
+                    "class_name": "ball",  # Force class name to ball
+                    "conf": float(conf) if conf is not None else None,
+                    "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+                    "object_id": 99999,  # Hardcoded ID for ball
+                })
+            processed_frames += 1
+            if processed_frames % checkpoint_interval == 0 or processed_frames == total_frames:
+                print(f"[Ball Detection] Processed {processed_frames}/{total_frames} frames ({(processed_frames/total_frames)*100:.1f}%)")
+
+        
 
     df = pd.DataFrame(rows)
     if df.empty:
