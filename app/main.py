@@ -1,12 +1,20 @@
 import os, io, uuid, tempfile, subprocess, datetime, pathlib
 from urllib.parse import urlparse
 from typing import List
+import math
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .services.team_assignment import assign_teams_for_match
 from .services.homography import estimate_homography_for_match
+from .services.analytics import (
+    compute_positions_df,
+    possession_timeseries,
+    control_area_timeseries,
+    momentum_timeseries,
+    FPS
+)
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -123,7 +131,7 @@ def _download_model_if_needed(model_meta: str, local_path: str):
     print(f"[model] downloaded {best_key} -> {local_path}")
     return local_path
 
-for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS):
+for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS, BUCKET_HOMOGRAPHY, BUCKET_TRACKS):
     try:
         ensure_bucket(b)
     except S3Error:
@@ -412,3 +420,80 @@ def homography_list(match_id: int):
     # sort by segment_index
     items.sort(key=lambda x: x.get("segment_index", 0))
     return JSONResponse(items)
+
+@app.get("/analytics/positions")
+def analytics_positions(match_id: int, bottom_center: bool = True, limit: int | None = None):
+    """
+    Project detections to pitch coordinates (normalized & meters).
+    Returns rows: frame_id, object_id, class_name, team_id, x_norm,y_norm,x_m,y_m
+    """
+    try:
+        df = compute_positions_df(
+            s3_internal, match_id,
+            BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY,
+            bottom_center=bottom_center
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    cols = ["frame_id","object_id","class_name","team_id","x_norm","y_norm","x_m","y_m"]
+    df = df[cols].dropna(subset=["x_norm","y_norm"])
+    if limit is not None:
+        df = df.head(int(limit))
+    return JSONResponse(df.to_dict(orient="records"))
+
+@app.get("/analytics/possession")
+def analytics_possession(
+    match_id: int,
+    max_dist_m: float = 4.0,
+    delta_margin_m: float = 0.5,
+):
+    """
+    Nearest-ball possession with hysteresis; returns timeseries + summary.
+    """
+    try:
+        pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, bottom_center=True)
+        ts, summary = possession_timeseries(pos, max_dist_m=max_dist_m, delta_margin_m=delta_margin_m, fps=FPS)
+        ts = ts.where(pd.notnull(ts), None)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Ensure all values are JSON-serializable
+    ts = ts.where(pd.notnull(ts), None)
+    records = ts.to_dict(orient="records")
+    # Clean any remaining non-finite values
+    for record in records:
+        for key, value in record.items():
+            if isinstance(value, float) and (pd.isna(value) or not math.isfinite(value)):
+                record[key] = None
+    return JSONResponse({"series": records, "summary": summary})
+
+@app.get("/analytics/control_zones")
+def analytics_control_zones(
+    match_id: int,
+    stride: int = FPS,   # compute ~each second
+):
+    """
+    Voronoi territory share (area %) per team over time, server-side.
+    """
+    try:
+        pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, bottom_center=True)
+        ctrl = control_area_timeseries(pos, stride=stride)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse({"series": ctrl.to_dict(orient="records")})
+
+@app.get("/analytics/momentum")
+def analytics_momentum(
+    match_id: int,
+    stride: int = FPS,
+    alpha: float = 0.1,
+):
+    """
+    Momentum index from territory (EWMA-smoothed area share).
+    """
+    try:
+        pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, bottom_center=True)
+        ctrl = control_area_timeseries(pos, stride=stride)
+        mom = momentum_timeseries(ctrl, alpha=alpha)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return JSONResponse({"series": mom.to_dict(orient="records")})
