@@ -2,6 +2,7 @@ import os, io, uuid, tempfile, subprocess, datetime, pathlib
 from urllib.parse import urlparse
 from typing import List
 import math
+import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +14,8 @@ from .services.analytics import (
     possession_timeseries,
     control_area_timeseries,
     momentum_timeseries,
+    _try_load_analytics,
+    _save_analytics,
     FPS
 )
 
@@ -47,6 +50,7 @@ BUCKET_DETECTIONS = os.getenv("BUCKET_DETECTIONS", "detections")
 BUCKET_TRACKS = os.getenv("BUCKET_TRACKS", "tracks")
 BUCKET_MODELS = os.getenv("BUCKET_MODELS", "models")
 BUCKET_HOMOGRAPHY = os.getenv("BUCKET_HOMOGRAPHY", "homography")
+BUCKET_ANALYTICS = os.getenv("BUCKET_ANALYTICS", "analytics")
 MODEL_LATEST_META = os.getenv("MODEL_LATEST_META", "yolov8n_football/latest.json")
 BALL_MODEL_LATEST_META = os.getenv("BALL_MODEL_LATEST_META", "ball_detection/latest.json")
 MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/models/best.pt")
@@ -131,7 +135,7 @@ def _download_model_if_needed(model_meta: str, local_path: str):
     print(f"[model] downloaded {best_key} -> {local_path}")
     return local_path
 
-for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS, BUCKET_HOMOGRAPHY, BUCKET_TRACKS):
+for b in (BUCKET_RAW, BUCKET_FRAMES, BUCKET_DETECTIONS, BUCKET_MODELS, BUCKET_HOMOGRAPHY, BUCKET_TRACKS, BUCKET_ANALYTICS):
     try:
         ensure_bucket(b)
     except S3Error:
@@ -421,79 +425,243 @@ def homography_list(match_id: int):
     items.sort(key=lambda x: x.get("segment_index", 0))
     return JSONResponse(items)
 
-@app.get("/analytics/positions")
-def analytics_positions(match_id: int, bottom_center: bool = True, limit: int | None = None):
+@app.post("/analytics/positions")
+def analytics_positions(match_id: int, bottom_center: bool = True):
     """
-    Project detections to pitch coordinates (normalized & meters).
-    Returns rows: frame_id, object_id, class_name, team_id, x_norm,y_norm,x_m,y_m
+    Compute and save positions to analytics bucket.
+    Returns success message and analytics key.
     """
     try:
         df = compute_positions_df(
             s3_internal, match_id,
-            BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY,
+            BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, BUCKET_ANALYTICS,
             bottom_center=bottom_center
         )
+        return JSONResponse({
+            "match_id": match_id,
+            "analysis_type": "positions",
+            "rows_computed": len(df),
+            "status": "success"
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    cols = ["frame_id","object_id","class_name","team_id","x_norm","y_norm","x_m","y_m"]
-    df = df[cols].dropna(subset=["x_norm","y_norm"])
-    if limit is not None:
-        df = df.head(int(limit))
-    return JSONResponse(df.to_dict(orient="records"))
 
-@app.get("/analytics/possession")
+@app.get("/analytics/{match_id}/positions")
+def get_analytics_positions(match_id: int, limit: int | None = None):
+    """
+    Get cached positions from analytics bucket.
+    Returns rows: frame_id, object_id, class_name, team_id, x_norm,y_norm,x_m,y_m
+    """
+    try:
+        df = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "positions")
+        if df is None:
+            raise HTTPException(status_code=404, detail="Positions not found. Run POST /analytics/positions first.")
+        
+        cols = ["frame_id","object_id","class_name","team_id","x_norm","y_norm","x_m","y_m"]
+        df = df[cols].dropna(subset=["x_norm","y_norm"])
+        if limit is not None:
+            df = df.head(int(limit))
+        
+        # Replace any remaining NaN values with None for JSON compatibility
+        df = df.replace({np.nan: None})
+        
+        return JSONResponse(df.to_dict(orient="records"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/analytics/possession")
 def analytics_possession(
     match_id: int,
     max_dist_m: float = 4.0,
     delta_margin_m: float = 0.5,
 ):
     """
-    Nearest-ball possession with hysteresis; returns timeseries + summary.
+    Compute and save nearest-ball possession with hysteresis to analytics bucket.
+    Returns success message and analytics key.
     """
     try:
-        pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, bottom_center=True)
+        # Try to load cached possession data first
+        cached = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "possession")
+        if cached is not None:
+            return JSONResponse({
+                "match_id": match_id,
+                "analysis_type": "possession",
+                "status": "already_exists",
+                "rows_computed": len(cached)
+            })
+        
+        # Try to load cached positions first, if not compute them
+        pos = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "positions")
+        if pos is None:
+            pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, BUCKET_ANALYTICS, bottom_center=True)
+        
         ts, summary = possession_timeseries(pos, max_dist_m=max_dist_m, delta_margin_m=delta_margin_m, fps=FPS)
-        ts = ts.where(pd.notnull(ts), None)
+        # Save possession results
+        _save_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "possession", ts)
+        
+        return JSONResponse({
+            "match_id": match_id,
+            "analysis_type": "possession",
+            "rows_computed": len(ts),
+            "summary": summary,
+            "status": "success"
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # Ensure all values are JSON-serializable
-    ts = ts.where(pd.notnull(ts), None)
-    records = ts.to_dict(orient="records")
-    # Clean any remaining non-finite values
-    for record in records:
-        for key, value in record.items():
-            if isinstance(value, float) and (pd.isna(value) or not math.isfinite(value)):
-                record[key] = None
-    return JSONResponse({"series": records, "summary": summary})
 
-@app.get("/analytics/control_zones")
+@app.get("/analytics/{match_id}/possession")
+def get_analytics_possession(match_id: int):
+    """
+    Get cached possession analysis from analytics bucket.
+    Returns timeseries and summary.
+    """
+    try:
+        ts = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "possession")
+        if ts is None:
+            raise HTTPException(status_code=404, detail="Possession analysis not found. Run POST /analytics/possession first.")
+        
+        # Recalculate summary from cached data
+        counts = ts["team"].value_counts(dropna=True).to_dict()
+        total = int(ts["team"].notna().sum())
+        pct = {int(k): round(v*100.0/total, 2) for k,v in counts.items()} if total else {}
+        summary = {"frames_counted": total, "percent_by_team": pct}
+        
+        # Ensure all values are JSON-serializable
+        ts = ts.where(pd.notnull(ts), None)
+        records = ts.to_dict(orient="records")
+        # Clean any remaining non-finite values
+        for record in records:
+            for key, value in record.items():
+                if isinstance(value, float) and (pd.isna(value) or not math.isfinite(value)):
+                    record[key] = None
+        return JSONResponse({"series": records, "summary": summary})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/analytics/control_zones")
 def analytics_control_zones(
     match_id: int,
     stride: int = FPS,   # compute ~each second
 ):
     """
-    Voronoi territory share (area %) per team over time, server-side.
+    Compute and save Voronoi territory share (area %) per team over time to analytics bucket.
+    Returns success message and analytics key.
     """
     try:
-        pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, bottom_center=True)
+        # Try to load cached control zones data first
+        cached = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "control_zones")
+        if cached is not None:
+            return JSONResponse({
+                "match_id": match_id,
+                "analysis_type": "control_zones",
+                "status": "already_exists",
+                "rows_computed": len(cached)
+            })
+        
+        # Try to load cached positions first, if not compute them
+        pos = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "positions")
+        if pos is None:
+            pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, BUCKET_ANALYTICS, bottom_center=True)
+        
         ctrl = control_area_timeseries(pos, stride=stride)
+        # Save control zones results
+        _save_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "control_zones", ctrl)
+        
+        return JSONResponse({
+            "match_id": match_id,
+            "analysis_type": "control_zones",
+            "rows_computed": len(ctrl),
+            "status": "success"
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return JSONResponse({"series": ctrl.to_dict(orient="records")})
 
-@app.get("/analytics/momentum")
+@app.get("/analytics/{match_id}/control_zones")
+def get_analytics_control_zones(match_id: int):
+    """
+    Get cached control zones analysis from analytics bucket.
+    Returns Voronoi territory share (area %) per team over time.
+    """
+    try:
+        ctrl = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "control_zones")
+        if ctrl is None:
+            raise HTTPException(status_code=404, detail="Control zones analysis not found. Run POST /analytics/control_zones first.")
+        
+        # Replace any NaN values with None for JSON compatibility
+        ctrl = ctrl.replace({np.nan: None})
+        
+        return JSONResponse({"series": ctrl.to_dict(orient="records")})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/analytics/momentum")
 def analytics_momentum(
     match_id: int,
     stride: int = FPS,
     alpha: float = 0.1,
 ):
     """
-    Momentum index from territory (EWMA-smoothed area share).
+    Compute and save momentum index from territory (EWMA-smoothed area share) to analytics bucket.
+    Returns success message and analytics key.
     """
     try:
-        pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, bottom_center=True)
-        ctrl = control_area_timeseries(pos, stride=stride)
+        # Try to load cached momentum data first
+        cached = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "momentum")
+        if cached is not None:
+            return JSONResponse({
+                "match_id": match_id,
+                "analysis_type": "momentum",
+                "status": "already_exists",
+                "rows_computed": len(cached)
+            })
+        
+        # Try to load cached control zones first
+        ctrl = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "control_zones")
+        if ctrl is None:
+            # Try to load cached positions first, if not compute them
+            pos = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "positions")
+            if pos is None:
+                pos = compute_positions_df(s3_internal, match_id, BUCKET_DETECTIONS, BUCKET_TRACKS, BUCKET_HOMOGRAPHY, BUCKET_ANALYTICS, bottom_center=True)
+            
+            ctrl = control_area_timeseries(pos, stride=stride)
+            # Save control zones results
+            _save_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "control_zones", ctrl)
+        
         mom = momentum_timeseries(ctrl, alpha=alpha)
+        # Save momentum results
+        _save_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "momentum", mom)
+        
+        return JSONResponse({
+            "match_id": match_id,
+            "analysis_type": "momentum",
+            "rows_computed": len(mom),
+            "status": "success"
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return JSONResponse({"series": mom.to_dict(orient="records")})
+
+@app.get("/analytics/{match_id}/momentum")
+def get_analytics_momentum(match_id: int):
+    """
+    Get cached momentum analysis from analytics bucket.
+    Returns momentum index from territory (EWMA-smoothed area share).
+    """
+    try:
+        mom = _try_load_analytics(s3_internal, BUCKET_ANALYTICS, match_id, "momentum")
+        if mom is None:
+            raise HTTPException(status_code=404, detail="Momentum analysis not found. Run POST /analytics/momentum first.")
+        
+        # Replace any NaN values with None for JSON compatibility
+        mom = mom.replace({np.nan: None})
+        
+        return JSONResponse({"series": mom.to_dict(orient="records")})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

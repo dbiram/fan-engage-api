@@ -26,6 +26,26 @@ def _load_parquet(s3, bucket: str, key: str) -> pd.DataFrame:
         s3.fget_object(bucket, key, dst)
         return pd.read_parquet(dst, engine="pyarrow")
 
+def _save_parquet(s3, bucket: str, key: str, df: pd.DataFrame) -> None:
+    """Save DataFrame to MinIO as parquet"""
+    with tempfile.TemporaryDirectory() as td:
+        local_path = os.path.join(td, "data.parquet")
+        df.to_parquet(local_path, engine="pyarrow")
+        s3.fput_object(bucket, key, local_path)
+
+def _try_load_analytics(s3, bucket_analytics: str, match_id: int, analysis_type: str) -> Optional[pd.DataFrame]:
+    """Try to load cached analytics results from BUCKET_ANALYTICS"""
+    try:
+        key = f"match_{match_id}/{analysis_type}.parquet"
+        return _load_parquet(s3, bucket_analytics, key)
+    except:
+        return None
+
+def _save_analytics(s3, bucket_analytics: str, match_id: int, analysis_type: str, df: pd.DataFrame) -> None:
+    """Save analytics results to BUCKET_ANALYTICS"""
+    key = f"match_{match_id}/{analysis_type}.parquet"
+    _save_parquet(s3, bucket_analytics, key, df)
+
 def load_detections_df(s3, bucket_detections: str, match_id: int) -> pd.DataFrame:
     key = _first_parquet_key(s3, bucket_detections, f"match_{match_id}/")
     df = _load_parquet(s3, bucket_detections, key)
@@ -92,8 +112,15 @@ def compute_positions_df(
     bucket_detections: str,
     bucket_tracks: str,
     bucket_homog: str,
+    bucket_analytics: str = None,
     bottom_center: bool = True,
 ) -> pd.DataFrame:
+    # Try to load cached positions first
+    if bucket_analytics:
+        cached = _try_load_analytics(s3, bucket_analytics, match_id, "positions")
+        if cached is not None:
+            return cached
+    
     det = load_detections_df(s3, bucket_detections, match_id)
     team_map = load_team_map(s3, bucket_tracks, match_id)
     hlist = load_homographies(s3, bucket_homog, match_id)
@@ -125,6 +152,11 @@ def compute_positions_df(
     out["x_norm"], out["y_norm"] = xs, ys
     out["x_m"], out["y_m"] = x_m, y_m
     out["team_id"] = team_ids
+    
+    # Save results to analytics bucket
+    if bucket_analytics:
+        _save_analytics(s3, bucket_analytics, match_id, "positions", out)
+    
     return out
 
 # -------- Possession (ball nearest) --------
