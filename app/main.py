@@ -26,6 +26,11 @@ from minio.error import S3Error
 from pydantic import BaseModel
 import pandas as pd
 import json
+
+from redis import Redis
+from rq import Queue, Retry
+from rq.job import Job
+
 from torch.serialization import add_safe_globals
 try:
     from ultralytics.nn.tasks import DetectionModel, SegmentationModel, PoseModel
@@ -56,6 +61,8 @@ BALL_MODEL_LATEST_META = os.getenv("BALL_MODEL_LATEST_META", "ball_detection/lat
 MODEL_LOCAL_PATH = os.getenv("MODEL_LOCAL_PATH", "/models/best.pt")
 BALL_MODEL_LOCAL_PATH = os.getenv("BALL_MODEL_LOCAL_PATH", "/models/ball_detection/best.pt")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+JOBS_QUEUE = os.getenv("JOBS_QUEUE", "default")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
@@ -107,6 +114,15 @@ s3_presign = make_minio_client(
     MINIO_SECURE, 
     region=MINIO_REGION
 )
+
+redis_conn = Redis.from_url(REDIS_URL)
+queue = Queue(JOBS_QUEUE, connection=redis_conn)
+
+def _job_or_404(job_id: str) -> Job:
+    try:
+        return Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        raise HTTPException(status_code=404, detail="job not found")
 
 def ensure_bucket(name: str):
     found = s3_internal.bucket_exists(name)
@@ -665,3 +681,38 @@ def get_analytics_momentum(match_id: int):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/jobs/pipeline")
+def create_pipeline_job(match_id: int, conf_thres: float = 0.1):
+    # optional idempotency: avoid duplicates
+    job = queue.enqueue(
+        "fe_workers.tasks.pipeline.job_pipeline",
+        match_id,
+        conf_thres=conf_thres,
+        retry=Retry(max=int(os.getenv("JOBS_MAX_RETRIES", "2"))),
+        job_timeout=int(os.getenv("JOBS_DEFAULT_TIMEOUT", "7200")),  # valid here
+        description=f"pipeline:{match_id}",
+    )
+    return {"job_id": job.id}
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = _job_or_404(job_id)
+    meta = job.meta or {}
+    return {
+        "id": job.id,
+        "status": job.get_status(),
+        "progress": meta.get("progress", 0),
+        "note": meta.get("note", ""),
+        "result": job.result if job.is_finished else None,
+        "exc": job.exc_info if job.is_failed else None,
+        "enqueued_at": str(job.enqueued_at) if job.enqueued_at else None,
+        "started_at": str(job.started_at) if job.started_at else None,
+        "ended_at": str(job.ended_at) if job.ended_at else None,
+    }
+
+@app.post("/jobs/{job_id}/cancel")
+def job_cancel(job_id: str):
+    job = _job_or_404(job_id)
+    job.cancel()
+    return {"ok": True}
